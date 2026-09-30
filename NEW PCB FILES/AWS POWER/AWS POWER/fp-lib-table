@@ -1,0 +1,6 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "ESP32-DEVKITC-32U(2)") (type "KiCad") (uri "/data/work/KiCAD FILES__PCB__1(1)/ESP32-DEVKITC-32U(2)") (options "") (descr ""))
+	(lib (name "AWS") (type "KiCad") (uri "/data/work/KiCAD FILES__PCB__1(1)/AWS.pretty") (options "") (descr ""))
+	(lib (name "SRD-05VDC-SL-C") (type "KiCad") (uri "/data/work/electronics/EASY HOME/version 3 electronics/library/SRD-05VDC-SL-C") (options "") (descr ""))
+)
