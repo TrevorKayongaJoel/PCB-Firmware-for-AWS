@@ -86,6 +86,14 @@
 // ========== Light Sleep ==========
 #define SLEEP_CHUNK_SEC    60          // wake at least this often to re-check the RTC
 
+// ========== Wall-clock alignment ==========
+// Bursts land on whole multiples of the interval (hh:00:00, hh:30:00 for 30 min)
+// so records line up with other stations. Light sleep only gets within a few
+// seconds of the slot - its clock is the ESP32's RC oscillator - so the sleep
+// ends ALIGN_GUARD_SEC early and the last stretch is timed on the DS3231.
+#define ALIGN_GUARD_SEC     15   // wake this far ahead of the slot
+#define ALIGN_MAX_WAIT_SEC  90   // further out than this is an off-schedule burst - run it now
+
 // ========== Time / RTC ==========
 // The DS3231 holds LOCAL time: East Africa Time (UTC+3, no DST).
 // SD logs and API payloads therefore all carry EAT.

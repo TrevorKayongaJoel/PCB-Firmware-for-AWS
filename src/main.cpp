@@ -189,6 +189,19 @@ void IRAM_ATTR rainISR() { countRainPulse(); }
 static uint32_t      clockRefEpoch  = 0;
 static unsigned long clockRefMillis = 0;
 
+// ---------- Light-sleep clock rate ----------
+// Across light sleep millis() runs off the RC slow clock, which is off by a few
+// percent and moves with temperature - in the field it lost ~20 s per 30 min
+// overnight and almost nothing at midday. RTC seconds per millis() second,
+// measured between consecutive slot arrivals and applied to the next sleep.
+// Adjacent intervals see near enough the same temperature for this to hold.
+static float         slowClockScale = 1.0f;
+static uint32_t      scaleRefEpoch  = 0;   // 0 = no reference (boot, or RTC was just set)
+static unsigned long scaleRefMillis = 0;
+
+// The slot this burst arrived on, or 0 when it did not land on one.
+static uint32_t      burstSlotEpoch = 0;
+
 // ---------- RTC bus pin swap ----------
 // The DS3231 is the one device on the bus whose SDA and SCL pads are crossed
 // (RTC_SDA/RTC_SCL), so every RTC access runs with the I2C peripheral
@@ -269,6 +282,76 @@ uint32_t currentEpoch() {
     return clockRefEpoch + (uint32_t)((millis() - clockRefMillis) / 1000UL);
   }
   return 0;
+}
+
+// ---------- Burst schedule ----------
+// The next burst goes on the next wall-clock multiple of the interval, not on
+// "now + interval". A relative schedule inherits every second the burst itself
+// takes and every second light sleep loses, and the station walks off the hour.
+// An absolute one only ever has this cycle's error, which alignToSlot() trims.
+static void scheduleNextBurst(uint32_t nowEpoch) {
+  uint32_t iv = (uint32_t)sleepIntervalSec;
+  if (nowEpoch == 0) {
+    // Clock unknown - there is no wall clock to align to.
+    nextCycleEpoch  = 0;
+    nextCycleMillis = millis() + iv * 1000UL;
+    return;
+  }
+
+  // Slots are counted from local midnight (the DS3231 holds EAT), so any
+  // interval runs 00:00, 00:00 + iv, ... - a 20 min interval gives :00 :20 :40.
+  // One that does not divide the day restarts at the next midnight.
+  uint32_t dayStart = nowEpoch - (nowEpoch % 86400UL);
+  nextCycleEpoch = dayStart + ((nowEpoch - dayStart) / iv + 1) * iv;
+  if (nextCycleEpoch > dayStart + 86400UL) nextCycleEpoch = dayStart + 86400UL;
+
+  long secsToSleep = (long)(nextCycleEpoch - nowEpoch) - ALIGN_GUARD_SEC;
+  if (secsToSleep < 0) secsToSleep = 0;
+  nextCycleMillis = millis() + (unsigned long)(secsToSleep * 1000.0f / slowClockScale);
+}
+
+// ---------- Land the burst on its slot ----------
+// Called with the rail just up, so the DS3231 is readable. Light sleep ends a
+// little ahead of the slot; this holds the burst until the RTC ticks over onto
+// the slot's own second, so the interval closes on hh:mm:00 to within a poll.
+static void alignToSlot() {
+  burstSlotEpoch = 0;
+  if (nextCycleEpoch == 0) return;
+
+  RtcBus bus;   // keep the pins swapped for the whole wait, not per poll
+  uint32_t now = currentEpoch();
+  if (now == 0 || !rtcOk || !rtcTimeValid) return;
+
+  long ahead = (long)nextCycleEpoch - (long)now;
+  // Far from the slot either way means this burst was not a timed wake - boot,
+  // the end of a debug session, or a cycle that overran - so run it as is.
+  if (ahead > ALIGN_MAX_WAIT_SEC || ahead < -ALIGN_MAX_WAIT_SEC) return;
+
+  if (ahead > 0) logStep("Holding %ld s for the slot...", ahead);
+  while (now < nextCycleEpoch) {
+    delay(10);
+    maybeCloseBuckets();
+    now = currentEpoch();
+    if (now == 0) return;
+  }
+  unsigned long arrivedMs = millis();
+
+  if (now == nextCycleEpoch) {
+    burstSlotEpoch = nextCycleEpoch;
+  } else {
+    logWarn("Burst %ld s late for its slot - widen ALIGN_GUARD_SEC if this repeats.",
+            (long)(now - nextCycleEpoch));
+  }
+
+  // Learn the slow clock's rate from this arrival and the last one. A late
+  // arrival is only good to 1 s, which over a whole interval is still fine.
+  if (scaleRefEpoch > 0 && now > scaleRefEpoch + 300) {
+    float s = (float)(now - scaleRefEpoch) * 1000.0f /
+              (float)(arrivedMs - scaleRefMillis);
+    if (s > 0.9f && s < 1.1f) slowClockScale = s;
+  }
+  scaleRefEpoch  = now;
+  scaleRefMillis = arrivedMs;
 }
 
 // ---------- Close out the interval ----------
@@ -1506,9 +1589,7 @@ void setup() {
   }
 
   // Seed the schedule and the queue depth so the portal is accurate on cycle one.
-  nextCycleMillis = millis() + (unsigned long)sleepIntervalSec * 1000UL;
-  uint32_t bootEpoch = currentEpoch();
-  if (bootEpoch > 0) nextCycleEpoch = bootEpoch + (uint32_t)sleepIntervalSec;
+  scheduleNextBurst(currentEpoch());
   queueDepthCached = queuedRecordCount();
 
   Serial.println(bmeOk ? TAG_OK   " BME280 present - pressure will be recorded."
@@ -1524,20 +1605,27 @@ void loop() {
   // PHASE 1: MEASURE (sensor rail up, radio still down)
   // ============================================
   sensorRailUp();             // power up, remount SD, re-init the I2C devices
+  alignToSlot();              // finish the approach to hh:mm:00 on the RTC
 
   // Close out the interval: snapshot and reset the wind/rain counters, then
   // derive average wind, gust and accumulated rainfall from them.
   snapshotPulseCounters();
 
   // Fix the next burst time now, while the rail is up and the RTC is
-  // reachable. Re-deriving it here every cycle means millis() drift over one
-  // interval never accumulates across cycles.
-  nextCycleMillis = millis() + (unsigned long)sleepIntervalSec * 1000UL;
-  uint32_t burstEpoch = currentEpoch();
-  nextCycleEpoch = (burstEpoch > 0) ? burstEpoch + (uint32_t)sleepIntervalSec : 0;
+  // reachable. It is an absolute slot, so nothing accumulates across cycles.
+  scheduleNextBurst(currentEpoch());
 
   DataRecord rec;
   readSensors(rec);
+  if (burstSlotEpoch > 0) {
+    // The interval closed on the slot's own second, so stamp the slot rather
+    // than the second or so of sensor reads that followed it.
+    DateTime t(burstSlotEpoch);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second());
+    rec.timestamp = buf;
+  }
   lastRecord     = rec;       // the config portal reads this
   haveLastRecord = true;
   printSensorValues(rec);
@@ -1843,6 +1931,7 @@ bool syncTimeFromNTP() {
                  ? (long)ntpTime.unixtime() - (long)before.unixtime()
                  : 0;
     rtc.adjust(ntpTime);
+    scaleRefEpoch  = 0;   // a step in the RTC would read as a clock-rate error
     rtcTimeValid   = true;
     clockRefEpoch  = ntpTime.unixtime();
     clockRefMillis = millis();
@@ -1913,6 +2002,7 @@ bool setRtcFromString(const String &input) {
   {
     RtcBus bus;
     rtc.adjust(dt);
+    scaleRefEpoch = 0;    // a step in the RTC would read as a clock-rate error
   }
   rtcTimeValid   = true;
   clockRefEpoch  = dt.unixtime();
